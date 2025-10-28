@@ -10,24 +10,27 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------
-# 설정
+# 기본 설정
 # ---------------------------------------------
 BRIDGE_PORT = 9013
 GIT_CLONE_DIR = Path("./workspace").resolve()
 GIT_CLONE_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Bridge Server (React ↔ FastAPI ↔ Node.js)")
+app = FastAPI(title="Bridge Server (React ↔ FastAPI)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---------------------------------------------
-# WebSocket (React UI 연결)
+# WebSocket 연결 (React UI용)
 # ---------------------------------------------
 clients: List[WebSocket] = []
 clients_lock = asyncio.Lock()
+
 
 async def broadcast(msg: Dict[str, Any]):
     """모든 연결된 React 클라이언트로 메시지 전송"""
@@ -40,6 +43,7 @@ async def broadcast(msg: Dict[str, Any]):
                 dead.append(ws)
         for d in dead:
             clients.remove(d)
+
 
 # ---------------------------------------------
 # 유틸 함수
@@ -69,7 +73,7 @@ def save_repo_index(repo_dir: Path):
 
 
 async def clone_or_update_repo_and_broadcast(url: str):
-    """GitHub repo clone/pull + 로그파일 + React 브로드캐스트"""
+    """GitHub repo clone/pull + 로그작성 + React로 브로드캐스트"""
     repo_name = url.split("/")[-1].replace(".git", "")
     dest = GIT_CLONE_DIR / repo_name
     logs_dir = Path("./logs")
@@ -120,18 +124,27 @@ async def clone_or_update_repo_and_broadcast(url: str):
         })
         return {"status": "error", "error": error_msg}
 
+
 # ---------------------------------------------
-# Node.js → FastAPI
+# React → FastAPI (POST /send)
 # ---------------------------------------------
-@app.post("/from_node")
-async def from_node(payload: Dict[str, Any] = Body(...)):
-    """Node.js → FastAPI 메시지 수신"""
-    print(f"[Bridge] Node.js 요청 수신: {payload}")
+@app.post("/send")
+async def from_react(payload: Dict[str, Any] = Body(...)):
+    """
+    React → FastAPI 메시지 수신 엔드포인트
+    """
+    print(f"[Bridge] React 요청 수신: {payload}")
     text = payload.get("text", "")
+    msg_type = payload.get("type", "unknown")
 
-    # React로 로그 알림
-    await broadcast({"type": "node_message", "text": text})
+    # React로 브로드캐스트 (Echo)
+    await broadcast({
+        "type": msg_type,
+        "text": f"📨 React sent: {text}",
+        "direction": "received",
+    })
 
+    # GitHub URL 자동 처리
     github_url = extract_github_url(text)
     if github_url:
         await broadcast({"type": "git_status", "text": f"📦 cloning {github_url}..."})
@@ -139,16 +152,17 @@ async def from_node(payload: Dict[str, Any] = Body(...)):
         await broadcast({"type": "git_result", "data": result})
         return {"result": result}
 
-    # GitHub URL이 없으면 로그로 저장
+    # 로그 저장
     logs_dir = Path("./logs")
     logs_dir.mkdir(exist_ok=True)
-    with open(logs_dir / "from_node.log", "a", encoding="utf-8") as f:
+    with open(logs_dir / "from_react.log", "a", encoding="utf-8") as f:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
-    return {"status": "ok", "message": "GitHub URL 없음. 로그로 저장됨."}
+    return {"status": "ok", "message": "React 메시지 수신 완료"}
+
 
 # ---------------------------------------------
-# React WebSocket
+# WebSocket (React UI 실시간 통신)
 # ---------------------------------------------
 @app.websocket("/ws/client")
 async def ws_client(ws: WebSocket):
@@ -168,6 +182,7 @@ async def ws_client(ws: WebSocket):
             if ws in clients:
                 clients.remove(ws)
         print("[Bridge] React client disconnected")
+
 
 # ---------------------------------------------
 # 실행
