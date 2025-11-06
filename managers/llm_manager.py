@@ -1,51 +1,56 @@
 import torch
+import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from pathlib import Path
 
 
 class LLMManager:
-    def __init__(self, model_name="Qwen/Qwen3-1.7B"):
+    def __init__(self, model_name="Qwen/Qwen3-1.7B", prompt_path: Path = Path("managers/prompt_config.yaml")):
         self.model_name = model_name
+        self.prompt_path = prompt_path
+        self.prompts = self._load_prompts()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype="auto",
             device_map="auto"
         )
-        print("[LLM] ✅ Model loaded successfully")
+        print(f"[LLM] ✅ {model_name} loaded with {len(self.prompts)} prompt profiles")
 
     # --------------------------------------------------------------
-    # 요약 전용 generate 함수
+    # YAML prompt 로드
     # --------------------------------------------------------------
-    def generate(self, prompt: str, max_new_tokens=512) -> str:
-        """summary 전용 LLM 호출 (junk-free, structured output)"""
-        messages = [{"role": "user", "content": prompt}]
-        text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True
-        )
+    def _load_prompts(self) -> dict:
+        if not Path(self.prompt_path).exists():
+            print(f"[LLM] ⚠️ Prompt config not found at {self.prompt_path}")
+            return {}
+        with open(self.prompt_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
 
+    # --------------------------------------------------------------
+    # LLM 호출 (task 단위)
+    # --------------------------------------------------------------
+    def generate(self, prompt: str, task: str = "general", max_new_tokens: int = 512) -> str:
+        """YAML에 정의된 system prompt를 context별로 적용"""
+        system_prompt = self.prompts.get(task, {}).get("system", "")
+        if not system_prompt:
+            print(f"[LLM] ⚠️ No system prompt found for task: {task}")
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
+
+        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
-        outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
 
+        outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
         gen_ids = outputs[0][len(inputs.input_ids[0]):]
         result = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-        # ---------- [1] thinking 제거 ----------
+        # cleanup
         if "</think>" in result:
             result = result.split("</think>")[-1]
-
-        # ---------- [2] <summary> 블록만 추출 ----------
-        if "<summary>" in result and "</summary>" in result:
-            result = result.split("<summary>")[-1].split("</summary>")[0]
-
-        # ---------- [3] 개행 정리 ----------
-        lines = [line.strip() for line in result.splitlines() if line.strip()]
-        if lines:
-            result = lines[-1]
-
-        # ---------- [4] NULL 문자 제거 ----------
         result = result.replace("\x00", "").replace("\u0000", "").strip()
 
-        return result or "(요약 실패)"
+        return result

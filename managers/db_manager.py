@@ -3,8 +3,8 @@ import re
 import psycopg2
 from psycopg2.extras import execute_values
 from pathlib import Path
-from typing import List, Dict, Any
 from datetime import datetime
+from typing import List, Dict, Any
 
 # ---------------------------------------------
 # DB 설정
@@ -29,10 +29,27 @@ def get_connection():
 
 
 # ---------------------------------------------
+# 전체 테이블 데이터 리셋 (TRUNCATE)
+# ---------------------------------------------
+def reset_all_tables():
+    """모든 주요 테이블 데이터 초기화"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        TRUNCATE TABLE repo_meta, files_meta, repo_chunks, symbol_links
+        RESTART IDENTITY CASCADE;
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print("✅ All tables truncated (data reset complete)")
+
+
+# ---------------------------------------------
 # README 요약 추출
 # ---------------------------------------------
 def extract_readme_summary(repo_path: Path) -> str:
-    """README.md에서 첫 문단 추출 (없으면 빈 문자열 반환)"""
+    """README.md에서 첫 문단 추출"""
     for name in ["README.md", "README.MD", "readme.md"]:
         readme = repo_path / name
         if readme.exists():
@@ -43,10 +60,9 @@ def extract_readme_summary(repo_path: Path) -> str:
 
 
 # ---------------------------------------------
-# 디렉터리 구조 기반 설명
+# 디렉터리 기반 구조 요약
 # ---------------------------------------------
 def generate_structure_summary(repo_path: Path) -> str:
-    """디렉터리 구조 기반 간단 설명 생성"""
     dirs, files = [], []
     for root, _, fs in os.walk(repo_path):
         if any(ig in root for ig in IGNORE_DIRS):
@@ -57,7 +73,7 @@ def generate_structure_summary(repo_path: Path) -> str:
         for f in fs:
             files.append(Path(f).suffix)
     file_types = {ext for ext in files if ext}
-    desc = f"이 저장소는 {len(dirs)}개의 폴더와 {len(files)}개의 파일로 구성되어 있으며, 주요 파일 확장자는 {', '.join(sorted(file_types))}입니다."
+    desc = f"이 저장소는 {len(dirs)}개의 폴더와 {len(files)}개의 파일로 구성되어 있으며, 주요 확장자는 {', '.join(sorted(file_types))}입니다."
     return desc
 
 
@@ -65,29 +81,15 @@ def generate_structure_summary(repo_path: Path) -> str:
 # 주요 언어 감지
 # ---------------------------------------------
 def detect_main_language(repo_path: Path) -> str:
-    """언어 확장자 기반 주요 언어 감지 (비코드 파일 제외)"""
+    """확장자 기반 언어 감지"""
     code_ext_map = {
-        ".py": "Python",
-        ".js": "JavaScript",
-        ".ts": "TypeScript",
-        ".java": "Java",
-        ".cpp": "C++",
-        ".c": "C",
-        ".cs": "C#",
-        ".go": "Go",
-        ".rs": "Rust",
-        ".rb": "Ruby",
-        ".php": "PHP",
-        ".swift": "Swift",
-        ".kt": "Kotlin",
-        ".m": "Objective-C",
-        ".scala": "Scala",
-        ".r": "R",
-        ".jl": "Julia",
-        ".ipynb": "Python",  # Jupyter Notebook도 Python 취급
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript", ".java": "Java",
+        ".cpp": "C++", ".c": "C", ".cs": "C#", ".go": "Go", ".rs": "Rust",
+        ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".kt": "Kotlin",
+        ".m": "Objective-C", ".scala": "Scala", ".r": "R", ".jl": "Julia",
+        ".ipynb": "Python",
     }
 
-    # 코드 파일만 카운트
     lang_count = {}
     for root, _, files in os.walk(repo_path):
         if any(ig in root for ig in IGNORE_DIRS):
@@ -99,26 +101,22 @@ def detect_main_language(repo_path: Path) -> str:
                 lang_count[lang] = lang_count.get(lang, 0) + 1
 
     if not lang_count:
-        # README에 특정 프레임워크 키워드로 추정
         readme_path = repo_path / "README.md"
         if readme_path.exists():
             readme = readme_path.read_text(encoding="utf-8", errors="ignore").lower()
             if "tensorflow" in readme or "pytorch" in readme:
                 return "Python"
-            if "node" in readme or "react" in readme:
+            if "react" in readme or "node" in readme:
                 return "JavaScript"
         return "Unknown"
 
-    # 가장 많은 언어 반환
     return max(lang_count, key=lang_count.get)
 
 
-
 # ---------------------------------------------
-# Repo Description 자동 생성
+# Repo 설명 생성
 # ---------------------------------------------
 def generate_repo_description(repo_path: Path) -> str:
-    """repo_meta.description 자동 생성 (README → 폴백 구조)"""
     description = extract_readme_summary(repo_path)
     if not description:
         description = generate_structure_summary(repo_path)
@@ -130,21 +128,19 @@ def generate_repo_description(repo_path: Path) -> str:
 # ---------------------------------------------
 def insert_repo_to_db(repo_name: str, repo_url: str, dest: Path):
     """
-    클론된 repo를 DB에 삽입
     - repo_meta: 메타데이터 등록
     - files_meta: 파일 목록 저장
-    - description 및 language 자동 생성
+    - description / language 자동 감지
     """
     try:
         conn = get_connection()
         cur = conn.cursor()
 
-        # ✅ 자동 생성 필드들
         description = generate_repo_description(dest)
         language = detect_main_language(dest)
-        total_chunks = 0  # 추후 임베딩 처리 후 업데이트
+        total_chunks = 0
 
-        # ✅ 중복 시 업데이트 처리 (repo_url 기준)
+        # ✅ repo_meta 삽입 또는 갱신
         cur.execute("""
             INSERT INTO repo_meta (repo_name, repo_url, description, language, total_files, total_chunks, indexed_at)
             VALUES (%s, %s, %s, ARRAY[%s], %s, %s, NOW())
@@ -160,7 +156,7 @@ def insert_repo_to_db(repo_name: str, repo_url: str, dest: Path):
         """, (repo_name, repo_url, description, language, 0, total_chunks))
         repo_id = cur.fetchone()[0]
 
-        # ✅ 파일 목록 수집
+        # ✅ 파일 목록 수집 및 삽입
         file_records = []
         for root, _, files in os.walk(dest):
             if any(ig in root for ig in IGNORE_DIRS):
@@ -170,14 +166,12 @@ def insert_repo_to_db(repo_name: str, repo_url: str, dest: Path):
                 ext = Path(f).suffix.replace(".", "")
                 file_records.append((repo_id, file_path, ext, None))
 
-        # ✅ files_meta 삽입
         if file_records:
             execute_values(cur, """
                 INSERT INTO files_meta (repo_id, file_path, file_type, summary)
                 VALUES %s;
             """, file_records)
 
-        # ✅ repo_meta total_files 갱신
         cur.execute(
             "UPDATE repo_meta SET total_files = %s WHERE id = %s;",
             (len(file_records), repo_id),
@@ -191,5 +185,5 @@ def insert_repo_to_db(repo_name: str, repo_url: str, dest: Path):
 
     except Exception as e:
         print(f"[DB] ❌ DB 삽입 오류: {e}")
-    
+
     return repo_id
