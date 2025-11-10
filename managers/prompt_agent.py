@@ -4,7 +4,8 @@ from pathlib import Path
 from managers.llm_manager import LLMManager
 from managers.db_manager import get_connection
 from psycopg2.extras import execute_values
-
+from managers.chunker import CodeChunker
+from managers.symbol import SymbolExtractor
 
 class LLMAgent:
     def __init__(self):
@@ -41,36 +42,90 @@ class LLMAgent:
     # -------------------------------------------------------------
     # 🔹 코드 semantic chunk 생성
     # -------------------------------------------------------------
-    def extract_chunks(self, file_path: Path):
-        """LLM으로 semantic chunk 분리"""
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")[:6000]
-        except Exception:
-            print(f"[Chunk] ❌ 파일 읽기 실패: {file_path}")
-            return []
-
-        user_prompt = f"File: {file_path.name}\n\nCode:\n{text}"
-        res = self.llm.generate(user_prompt, task="chunking", max_new_tokens=2048)
-
-        match = re.search(r"(\[.*\])", res, re.DOTALL)
+    def safe_json_parse(self, raw: str):
+        """LLM 출력 문자열을 안전하게 JSON으로 변환 (깨짐 보정 포함)"""
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
         if not match:
-            print(f"[Chunk] ⚠️ No JSON block found for {file_path}")
             return []
+        clean = match.group(0)
+
+        # 기본 문자 정리
+        clean = clean.replace("’", "'").replace("“", '"').replace("”", '"')
+        clean = re.sub(r"^```(json)?|```$", "", clean.strip(), flags=re.MULTILINE)
+
+        # 🧩 content 내부의 " escape 처리
+        def escape_quotes_in_content(m):
+            content = m.group(1)
+            # \ 먼저 escape → " escape
+            content = content.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"content": "{content}"'
+
+        # "content": " ... " 부분을 찾아 내부 따옴표 이스케이프
+        clean = re.sub(r'"content":\s*"(.*?)"', escape_quotes_in_content, clean, flags=re.DOTALL)
+
+        # 객체 간 쉼표 누락 보정 (}{ → },{)
+        clean = re.sub(r'(?<=\})(\s*)(?=\{)', ', ', clean)
+
+        # 배열 또는 객체 끝의 트레일링 콤마 제거
+        clean = re.sub(r",\s*(\]|\})", r"\1", clean)
 
         try:
-            json_str = match.group(1).replace("'", '"').replace("\x00", "")
-            chunks = json.loads(json_str)
-            return [
-                {
-                    "semantic_scope": c.get("semantic_scope", "").strip(),
-                    "hierarchical_context": c.get("hierarchical_context", "").strip(),
-                    "content": c.get("content", "").strip(),
-                }
-                for c in chunks if isinstance(c, dict)
-            ]
-        except Exception as e:
-            print(f"[Chunk] ⚠️ JSON parsing failed for {file_path}: {e}")
+            return json.loads(clean)
+        except json.JSONDecodeError as e:
+            print(f"[Chunk] ⚠️ Safe JSON decode error: {e}")
+            print("---- raw json ----")
+            print(clean[:])
+            print("------------------")
             return []
+
+
+
+    def extract_chunks(self, file_path: Path):
+        chunker = CodeChunker()
+        chunks = chunker.extract_chunks(file_path)
+        if not chunks:
+            print(f"[Chunk] ⚠️ {file_path.name}: no chunks found")
+            return []
+        print(f"[Chunk] ✅ {file_path.name}: {len(chunks)} chunks parsed locally")
+        return chunks
+        
+    # -------------------------------------------------------------
+    # 🔹 symbol_links (AST + LLM hybrid)
+    # -------------------------------------------------------------
+    def extract_symbol_links(self, repo_id: int, repo_dir: Path):
+        """AST + LLM hybrid 방식으로 symbol_links 채우기"""
+        from managers.symbol import SymbolExtractor  # 이미 상단 import되어 있으면 생략 가능
+        from managers.db_manager import get_connection
+        from psycopg2.extras import execute_values
+
+        extractor = SymbolExtractor(llm=self.llm)
+        all_links = []
+
+        for py_file in repo_dir.rglob("*.py"):
+            try:
+                links = extractor.extract_links(py_file, repo_id)
+                if links:
+                    all_links.extend(links)
+            except Exception as e:
+                print(f"[SymbolExtractor] ⚠️ {py_file} skipped: {e}")
+
+        if not all_links:
+            print(f"[SymbolExtractor] ⚠️ No symbol links found for repo_id={repo_id}")
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+        execute_values(cur, """
+            INSERT INTO symbol_links (repo_id, source_symbol, target_symbol, relation_type, file_path)
+            VALUES %s
+        """, [
+            (l["repo_id"], l["source_symbol"], l["target_symbol"], l["relation_type"], l["file_path"])
+            for l in all_links
+        ])
+        conn.commit()
+        cur.close()
+        conn.close()
+        print(f"[SymbolExtractor] ✅ Inserted {len(all_links)} symbol links for repo_id={repo_id}")
 
     # -------------------------------------------------------------
     # 🔹 repo_id 기준으로 파일 전체 요약

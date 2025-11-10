@@ -39,6 +39,21 @@ const buildMessageKey = (msg: Msg) =>
     msg.text ?? JSON.stringify(msg.data ?? {})
   }|${msg.tabId ?? ""}`;
 
+const handleResetDB = async () => {
+  try {
+    const res = await axios.post("http://localhost:9013/reset_db");
+    const data = res.data;
+    if (data.status === "ok") {
+      alert("✅ Database reset complete!");
+    } else {
+      alert(`⚠️ Reset failed: ${data.message}`);
+    }
+  } catch (err) {
+    console.error("DB reset failed:", err);
+    alert("❌ Error while resetting database.");
+  }
+};
+
 // ✅ 폴더 트리 컴포넌트
 const TreeView = ({
   node,
@@ -451,6 +466,12 @@ export default function App() {
             >
               Reset LLM
             </button>
+            <button
+              onClick={handleResetDB}
+              className="text-sm px-3 py-1 rounded-full bg-red-500/80 hover:bg-red-600 text-white shadow transition"
+            >
+              Reset DB
+            </button>            
           </div>
         </div>
 

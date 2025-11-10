@@ -11,6 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, Query
 from fastapi.middleware.cors import CORSMiddleware
 from managers.db_manager import insert_repo_to_db
 from managers.prompt_agent import LLMAgent
+from managers.db_manager import get_connection
 
 
 BASE_DIR = Path(__file__).parent.resolve()
@@ -80,21 +81,51 @@ async def clone_repo_and_broadcast(url: str):
     repo_id = await asyncio.to_thread(insert_repo_to_db, repo_name, url, dest)
 
     agent = LLMAgent()
-    await broadcast({"type": "git_status", "text": "🧠 Summarizing files..."})
+    await broadcast({"type": "git_status", "text": "Summarizing files..."})
     await asyncio.to_thread(agent.summarize_repo_files, repo_id, dest)
 
-    await broadcast({"type": "git_status", "text": "🧩 Generating chunks..."})
+    await broadcast({"type": "git_status", "text": "Generating chunks..."})
     await asyncio.to_thread(agent.chunk_repo_files, repo_id, dest)
-
+    
+    # ✅ symbol_links 생성 추가
+    await broadcast({"type": "git_status", "text": "Extracting symbol links..."})
+    await asyncio.to_thread(agent.extract_symbol_links, repo_id, dest)    
+    
     await broadcast({"type": "git_status", "text": "✅ Done."})
 
+@app.on_event("startup")
+async def startup_event():
+    print("========== DEBUG PATH CHECK ==========")
+    print(f"[DEBUG] BASE_DIR: {BASE_DIR}")
+    print(f"[DEBUG] GIT_CLONE_DIR: {GIT_CLONE_DIR}")
+    print(f"[DEBUG] Exists(GIT_CLONE_DIR): {GIT_CLONE_DIR.exists()}")
+    print("======================================")  
 
+@app.post("/reset_db")
+async def reset_db():
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            TRUNCATE TABLE repo_meta, files_meta, repo_chunks, symbol_links
+            RESTART IDENTITY CASCADE;
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"status":"ok", "message": "All tables truncated"}
+    except Exception as e:
+        return {"status" : "error", "message":str(e)}
+        
 @app.post("/send")
 async def from_react(payload: Dict[str, Any] = Body(...)):
     text = payload.get("text", "")
     github_url = extract_github_url(text)
+
     if github_url:
-        return await clone_repo_and_broadcast(github_url)
+        asyncio.create_task(clone_repo_and_broadcast(github_url))
+        return {"status": "ok", "message": "Repository cloning and analysis started."}
+
     return {"status": "ok", "message": "GitHub URL not found"}
 
 
@@ -120,6 +151,19 @@ async def get_initial_tree():
 
     trees = [build_dir_tree(e) for e in entries]
     return {"status": "ok", "trees": trees}
+
+@app.get("/file")
+async def get_file_content(path: str = Query(...)):
+    target = (GIT_CLONE_DIR / path).resolve()
+    if not target.exists():
+        return {"status": "error", "message": f"file not found: {target}"}
+    if target.is_dir():
+        return {"status": "error", "message": "cannot open directory"}
+    try:
+        content = target.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        return {"status": "error", "message": f"read failed: {e}"}
+    return {"status": "ok", "content": content}
 
 @app.get("/history")
 async def get_history(limit: int = 100):
@@ -151,5 +195,5 @@ async def get_history(limit: int = 100):
     return {"status": "ok", "history": history}
 
 if __name__ == "__main__":
-    import uvicorn
+    import uvicorn  
     uvicorn.run("bridge_server:app", host="0.0.0.0", port=BRIDGE_PORT, reload=False)
