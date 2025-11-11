@@ -6,6 +6,8 @@ from managers.db_manager import get_connection
 from psycopg2.extras import execute_values
 from managers.chunker import CodeChunker
 from managers.symbol import SymbolExtractor
+from managers.embedding import EmbeddingManager
+
 
 class LLMAgent:
     def __init__(self):
@@ -155,13 +157,21 @@ class LLMAgent:
     # -------------------------------------------------------------
     # 🔹 repo_id 기준으로 전체 chunk 생성 후 DB 저장
     # -------------------------------------------------------------
+
     def chunk_repo_files(self, repo_id: int, repo_dir: Path):
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id, file_path, file_type FROM files_meta WHERE repo_id = %s;", (repo_id,))
+
+        cur.execute("""
+            SELECT id, file_path, file_type
+            FROM files_meta
+            WHERE repo_id = %s;
+        """, (repo_id,))
         files = cur.fetchall()
-        cur.close()
-        conn.close()
+
+        embedder = EmbeddingManager()  # ✅ SentenceTransformer 사용
+        all_values = []
+        total_chunks = 0
 
         for file_id, rel_path, file_type in files:
             path = repo_dir / rel_path
@@ -172,10 +182,9 @@ class LLMAgent:
             if not chunks:
                 continue
 
-            conn = get_connection()
-            cur = conn.cursor()
-            values = [
-                (
+            for c in chunks:
+                emb = embedder.embed_text(c["content"])  # ✅ content 임베딩
+                all_values.append((
                     repo_id,
                     file_id,
                     str(path),
@@ -184,17 +193,29 @@ class LLMAgent:
                     c["hierarchical_context"],
                     c["content"],
                     len(c["content"].split()),
-                    None,
-                )
-                for c in chunks
-            ]
+                    emb.tolist(),  # ✅ vector(1024)
+                ))
+
+            total_chunks += len(chunks)
+            print(f"[Chunk+Embed] ✅ {path.name}: {len(chunks)} chunks embedded")
+
+        if all_values:
             execute_values(cur, """
                 INSERT INTO repo_chunks
                 (repo_id, file_id, file_path, file_type,
-                 semantic_scope, hierarchical_context, content, token_count, embedding)
+                semantic_scope, hierarchical_context, content, token_count, embedding)
                 VALUES %s;
-            """, values)
-            conn.commit()
-            cur.close()
-            conn.close()
-            print(f"[Chunk] ✅ {path.name}: {len(chunks)} chunks inserted.")
+            """, all_values)
+            print(f"[Chunk+Embed] 🚀 Inserted {len(all_values)} chunks (with embeddings) for repo_id={repo_id}")
+
+            # ✅ repo_meta 업데이트
+            cur.execute("""
+                UPDATE repo_meta
+                SET total_chunks = %s
+                WHERE id = %s;
+            """, (total_chunks, repo_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
