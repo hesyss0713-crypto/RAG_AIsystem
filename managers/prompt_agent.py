@@ -163,7 +163,9 @@ class LLMAgent:
                 continue
             try:
                 summary = self.summarize_file(fpath)
-                cur.execute("UPDATE files_meta SET summary = %s WHERE id = %s;", (summary, file_id))
+                files_emb = self.emb.embed_text(summary)
+                cur.execute("UPDATE files_meta SET summary = %s, embedding = %s WHERE id = %s;", 
+                (summary, files_emb.tolist(), file_id))
 
                 if summary and len(summary.strip()) > 0:
                     collected_summaries.append({
