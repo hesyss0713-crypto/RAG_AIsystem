@@ -58,6 +58,28 @@ def extract_readme_summary(repo_path: Path) -> str:
             return paragraphs[0][:500]
     return ""
 
+# ---------------------------------------------
+# README 충분성 판단
+# ---------------------------------------------
+def is_readme_sufficient(text: str) -> bool:
+    text = text.lower()
+    length = len(text)
+
+    if length < 80:
+        return False
+
+    keywords = [
+        "this project", "goal", "purpose", "implement", "model",
+        "dataset", "python", "pytorch", "tensorflow", "react"
+    ]
+    if any(k in text for k in keywords):
+        return True
+
+    useless = ["install", "installation", "license", "contributing", "welcome"]
+    if any(u in text for u in useless) and not any(k in text for k in keywords):
+        return False
+
+    return length > 300
 
 # ---------------------------------------------
 # 디렉터리 기반 구조 요약
@@ -118,10 +140,11 @@ def detect_main_language(repo_path: Path) -> str:
 # ---------------------------------------------
 def generate_repo_description(repo_path: Path) -> str:
     description = extract_readme_summary(repo_path)
-    if not description:
-        description = generate_structure_summary(repo_path)
-    return description
-
+    
+    if description and is_readme_sufficient(description):
+        return description
+    
+    return generate_structure_summary(repo_path)
 
 # ---------------------------------------------
 # Repo + Files 삽입
