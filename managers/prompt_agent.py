@@ -8,11 +8,28 @@ from managers.chunker import CodeChunker
 from managers.symbol import SymbolExtractor
 from managers.embedding import EmbeddingManager
 
+_shared_llm = None
+_shared_emb = None
+
+
+def get_llm_manager():
+    global _shared_llm
+    if _shared_llm is None:
+        _shared_llm = LLMManager()
+    return _shared_llm
+
+
+def get_embedding_manager():
+    global _shared_emb
+    if _shared_emb is None:
+        _shared_emb = EmbeddingManager()
+    return _shared_emb
+
 
 class LLMAgent:
     def __init__(self):
-        self.llm = LLMManager()
-        self.emb = EmbeddingManager()
+        self.llm = get_llm_manager()
+        self.emb = get_embedding_manager()
 
     # -------------------------------------------------------------
     # 🔹 파일 요약
@@ -147,7 +164,6 @@ class LLMAgent:
             try:
                 summary = self.summarize_file(fpath)
                 cur.execute("UPDATE files_meta SET summary = %s WHERE id = %s;", (summary, file_id))
-                conn.commit()
 
                 if summary and len(summary.strip()) > 0:
                     collected_summaries.append({
