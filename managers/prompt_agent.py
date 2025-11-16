@@ -8,28 +8,11 @@ from managers.chunker import CodeChunker
 from managers.symbol import SymbolExtractor
 from managers.embedding import EmbeddingManager
 
-_shared_llm = None
-_shared_emb = None
-
-
-def get_llm_manager():
-    global _shared_llm
-    if _shared_llm is None:
-        _shared_llm = LLMManager()
-    return _shared_llm
-
-
-def get_embedding_manager():
-    global _shared_emb
-    if _shared_emb is None:
-        _shared_emb = EmbeddingManager()
-    return _shared_emb
-
 
 class LLMAgent:
-    def __init__(self):
-        self.llm = get_llm_manager()
-        self.emb = get_embedding_manager()
+    def __init__(self, llm: LLMManager | None = None):
+        # Allow sharing a single LLMManager instance to avoid duplicate model loads.
+        self.llm = llm or LLMManager()
 
     # -------------------------------------------------------------
     # 🔹 파일 요약
@@ -45,6 +28,8 @@ class LLMAgent:
             return "머신러닝 모델의 데이터 또는 가중치 파일입니다."
         if ext in [".csv", ".xlsx"]:
             return "데이터셋 파일입니다."
+        if ext in [".md", ".txt"]:
+            return f"{file_path.name} 문서 파일입니다."
 
         try:
             text = file_path.read_text(encoding="utf-8", errors="ignore")[:4000]
@@ -52,11 +37,10 @@ class LLMAgent:
             return "파일을 읽을 수 없습니다."
 
         user_prompt = f"File name: {file_path.name}\n\nCode content:\n{text}"
-        result = self.llm.generate(user_prompt, task="summarization", max_new_tokens=2048)
+        result = self.llm.generate(user_prompt, task="summarization", max_new_tokens=512)
         if "<summary>" in result:
             result = result.split("<summary>")[-1].split("</summary>")[0]
         return result.strip()
-
 
     # -------------------------------------------------------------
     # 🔹 코드 semantic chunk 생성
@@ -155,39 +139,18 @@ class LLMAgent:
         cur.execute("SELECT id, file_path FROM files_meta WHERE repo_id = %s;", (repo_id,))
         files = cur.fetchall()
 
-        collected_summaries = []
-
         for file_id, rel_path in files:
             fpath = repo_dir / rel_path
             if not fpath.exists():
                 continue
             try:
                 summary = self.summarize_file(fpath)
-                files_emb = self.emb.embed_text(summary)
-                cur.execute("UPDATE files_meta SET summary = %s, embedding = %s WHERE id = %s;", 
-                (summary, files_emb.tolist(), file_id))
-
-                if summary and len(summary.strip()) > 0:
-                    collected_summaries.append({
-                        "summary": summary
-                    })
-
+                cur.execute("UPDATE files_meta SET summary = %s WHERE id = %s;", (summary, file_id))
+                conn.commit()
                 print(f"[Summary] ✅ {rel_path}")
             except Exception as e:
                 print(f"[Summary] ⚠️ {rel_path}: {e}")
-        all_summaries = "\n".join([s["summary"] for s in collected_summaries])
-        print(f"all summay : \n{all_summaries}\n")
 
-        repo_summ = self.llm.generate(all_summaries, task = "repo_summary", max_new_tokens=2048)
-        print(f"repo summ : \n{repo_summ}\n")
-        repo_summ_emb = self.emb.embed_text(repo_summ)
-
-        cur.execute("""
-            UPDATE repo_meta
-            SET repo_summary = %s, summary_embedding = %s
-            WHERE id = %s;
-        """, (repo_summ, repo_summ_emb.tolist(), repo_id))
-        conn.commit()
         cur.close()
         conn.close()
         print(f"[Summary] ✅ repo_id={repo_id} summaries complete")
@@ -207,7 +170,7 @@ class LLMAgent:
         """, (repo_id,))
         files = cur.fetchall()
 
-        embedder = self.emb  
+        embedder = EmbeddingManager()  # ✅ SentenceTransformer 사용
         all_values = []
         total_chunks = 0
 
@@ -256,4 +219,3 @@ class LLMAgent:
         conn.commit()
         cur.close()
         conn.close()
-
