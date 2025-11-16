@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -97,6 +98,51 @@ class RoutingManager:
         "direct_answer": ("direct", "chat", "general"),
     }
 
+    CLAUSE_SPLIT_PATTERN = re.compile(r"(?:\n+|[.?!])")
+    ENUMERATION_PATTERN = re.compile(r"\s*\d+\)\s*")
+
+    READ_KEYWORDS: tuple[str, ...] = (
+        "조회",
+        "읽어",
+        "열어",
+        "내용",
+        "보여줘",
+        "확인",
+        "살펴",
+        "inspect",
+        "show",
+        "display",
+        "list",
+        "어디",
+        "무엇",
+    )
+    MODIFY_KEYWORDS: tuple[str, ...] = (
+        "수정",
+        "변경",
+        "바꿔",
+        "바꾸",
+        "바뀌",
+        "교체",
+        "덮어",
+        "추가",
+        "삭제",
+        "적용",
+        "업데이트",
+        "갱신",
+        "refactor",
+        "replace",
+        "update",
+        "modify",
+        "edit",
+        "patch",
+        "fix",
+        "convert",
+        "conversion",
+        "변환",
+        "옮겨",
+        "이식",
+    )
+
     EXPLICIT_INTENT_SIGNALS: Dict[str, tuple[str, ...]] = {
         "lookup": ("lookup", "찾아", "search"),
         "read": ("read", "열어", "내용"),
@@ -132,6 +178,8 @@ class RoutingManager:
         safety = self._run_safety_router(user_text, state, query_embedding)
 
         routing_context = self.aggregator(source=source, intent=intent, safety=safety, self_check=self_check)
+        action_plan = self._build_action_plan(user_text)
+        routing_context["action_plan"] = action_plan
 
         function_router_choice = await self._run_function_router(routing_context)
 
@@ -153,6 +201,7 @@ class RoutingManager:
             "fallback_function": fallback_choice,
             "final_function": final_call,
             "function_call": final_call,
+            "action_plan": action_plan,
         }
 
     async def _run_source_router(self, user_text: str, state: Dict[str, Any], query_embedding: Optional[np.ndarray]) -> Dict[str, Any]:
@@ -264,6 +313,130 @@ class RoutingManager:
         state["last_intent"] = routing_context.get("final_intent")
         state["last_user_query"] = user_text
         state["last_query_embedding"] = query_embedding
+
+    def _build_action_plan(self, user_text: str) -> Dict[str, Any]:
+        analysis = self._analyze_action_signals(user_text)
+        mode = analysis["mode"]
+        steps: list[dict[str, str]] = []
+        llm_guidance = "요청에 맞춰 기본 응답만 생성하세요."
+        reason = analysis.get("reason", "명확한 시그널 없음")
+
+        if mode == "read_then_modify":
+            steps = [
+                {
+                    "id": "read_context",
+                    "title": "맥락 조회",
+                    "description": "관련 파일이나 코드 블록을 도구로 열어 현재 상태를 파악합니다.",
+                },
+                {
+                    "id": "llm_modify",
+                    "title": "LLM 수정",
+                    "description": "조회한 내용을 바탕으로 LLM이 요청한 수정 사항(코드/설명/patch)을 생성합니다.",
+                },
+            ]
+            llm_guidance = (
+                "도구로 읽어온 결과를 그대로 전달하지 말고, 사용자 요청에 따라 수정된 결과물을 LLM으로 작성하세요."
+            )
+        elif mode == "read_only":
+            steps = [
+                {
+                    "id": "read_context",
+                    "title": "정보 조회",
+                    "description": "필요한 파일이나 데이터를 열람해 사용자 질문에 필요한 정보를 수집합니다.",
+                }
+            ]
+            llm_guidance = "조회한 내용을 기반으로 설명이나 요약만 제공하면 됩니다."
+
+        return {
+            "mode": mode,
+            "reason": reason,
+            "signals": analysis["signals"],
+            "clauses": analysis.get("clauses"),
+            "needs_llm_transformation": mode == "read_then_modify",
+            "steps": steps,
+            "llm_guidance": llm_guidance,
+        }
+
+    def _analyze_action_signals(self, user_text: str | None) -> Dict[str, Any]:
+        normalized = self._normalize_action_text(user_text)
+        clauses = self._split_action_clauses(normalized)
+        clause_details: list[dict[str, Any]] = []
+        read_hits: set[str] = set()
+        modify_hits: set[str] = set()
+
+        for clause in clauses:
+            clause_read = self._match_keywords(clause, self.READ_KEYWORDS)
+            clause_modify = self._match_keywords(clause, self.MODIFY_KEYWORDS)
+            if clause_read or clause_modify:
+                clause_details.append(
+                    {
+                        "clause": clause,
+                        "read_signals": clause_read,
+                        "modify_signals": clause_modify,
+                    }
+                )
+            read_hits.update(clause_read)
+            modify_hits.update(clause_modify)
+
+        if modify_hits:
+            mode = "read_then_modify"
+            reason = self._build_clause_reason(clause_details, prefer="modify")
+        elif read_hits:
+            mode = "read_only"
+            reason = self._build_clause_reason(clause_details, prefer="read")
+        else:
+            mode = "unknown"
+            reason = "no strong signals"
+
+        return {
+            "mode": mode,
+            "signals": {"read": sorted(read_hits), "modify": sorted(modify_hits)},
+            "clauses": clause_details,
+            "needs_llm_transformation": mode == "read_then_modify",
+            "reason": reason,
+        }
+
+    def _normalize_action_text(self, text: str | None) -> str:
+        if not text:
+            return ""
+        lowered = text.lower()
+        lowered = lowered.replace("->", " ")
+        lowered = self.ENUMERATION_PATTERN.sub(" ", lowered)
+        lowered = re.sub(r"\s+", " ", lowered)
+        return lowered.strip()
+
+    def _split_action_clauses(self, text: str) -> list[str]:
+        if not text:
+            return []
+        raw = self.CLAUSE_SPLIT_PATTERN.split(text)
+        clauses: list[str] = []
+        for segment in raw:
+            seg = segment.strip()
+            if not seg:
+                continue
+            seg = re.sub(r"\b(그러면|그럼|그리고|그런데)\b", "", seg).strip()
+            if seg:
+                clauses.append(seg)
+        return clauses or [text]
+
+    @staticmethod
+    def _match_keywords(text: str, keywords: tuple[str, ...]) -> list[str]:
+        hits: list[str] = []
+        for kw in keywords:
+            if kw and kw in text:
+                hits.append(kw)
+        return hits
+
+    @staticmethod
+    def _build_clause_reason(clause_details: list[dict[str, Any]], prefer: str) -> str:
+        for detail in clause_details:
+            signals = detail["modify_signals" if prefer == "modify" else "read_signals"]
+            if signals:
+                sample = detail["clause"]
+                if len(sample) > 60:
+                    sample = sample[:57] + "..."
+                return f"{prefer} signal {signals} in '{sample}'"
+        return f"{prefer} signals detected"
 
 
 class FallbackRouter:

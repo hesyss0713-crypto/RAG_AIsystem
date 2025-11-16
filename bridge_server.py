@@ -205,6 +205,24 @@ def _collect_symbol_snippets(user_text: str, repo_root: Path, max_total: int = 3
     return snippets, used_symbols
 
 
+def _format_action_plan_block(plan: Dict[str, Any] | None) -> str:
+    """Convert action plan metadata into a textual block for the LLM prompt."""
+    if not plan or plan.get("mode") in {None, "unknown"}:
+        return ""
+    lines = ["### Action Plan ###", f"Mode: {plan.get('mode')} ({plan.get('reason', 'no reason')})"]
+    steps = plan.get("steps") or []
+    for idx, step in enumerate(steps, start=1):
+        title = step.get("title") or step.get("id") or f"Step {idx}"
+        desc = step.get("description", "")
+        lines.append(f"{idx}. {title}: {desc}")
+    guidance = plan.get("llm_guidance")
+    if guidance:
+        lines.append("")
+        lines.append("LLM Guidance:")
+        lines.append(guidance)
+    return "\n".join(lines)
+
+
 def _build_torch_source_prompt(user_text: str) -> str | None:
     context = torch_loader.build_context_from_text(user_text)
     if not context:
@@ -318,11 +336,15 @@ async def handle_user_message(user_text: str, tab_id: int | None):
 
         routing_result = await routing_manager.route(user_text, self_check, state_key=conversation_id)
         function_call = routing_result.get("function_call") or {}
+        action_plan = routing_result.get("action_plan") or {}
         plan_meta = {
             "name": function_call.get("name"),
             "confidence": function_call.get("confidence"),
             "reason": function_call.get("reason"),
         }
+        if action_plan:
+            plan_meta["actionPlan"] = action_plan
+            plan_meta["needsLLMTransformation"] = action_plan.get("needs_llm_transformation")
 
         tool_block = ""
         executed_function = None
@@ -372,6 +394,9 @@ async def handle_user_message(user_text: str, tab_id: int | None):
         full_prompt = context_manager.build_prompt(conversation_id, user_text, include_history=include_history)
         if tool_block:
             full_prompt = f"{full_prompt}\n\n{tool_block}"
+        plan_block = _format_action_plan_block(action_plan)
+        if plan_block:
+            full_prompt = f"{full_prompt}\n\n{plan_block}"
 
         response_text = await run_llm_call(full_prompt, task=PRIMARY_TASK)
         clean_response = _strip_reasoning_output(response_text)
@@ -462,7 +487,7 @@ async def run_llm_call(
     prompt: str,
     *,
     task: str,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 2048,
     system_override: str | None = None,
 ) -> str:
     async with llm_lock:
